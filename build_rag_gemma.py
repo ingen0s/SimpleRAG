@@ -15,6 +15,7 @@ import json
 import re
 import requests
 import base64
+import shutil
 
 # Allow override of photo and video folders via environment variables for Docker compatibility
 photo_folder = os.environ.get("RAG_PHOTO_FOLDER", os.path.expanduser("~/Pictures/RAG_Photos"))
@@ -88,7 +89,7 @@ def query_gemma3(image, prompt):
                 ]
             }
         ],
-        "max_tokens": 500,  # Increased for more detailed response
+        "max_tokens": 500,
         "temperature": 0.7,
         "top_p": 0.95,
         "top_k": 64
@@ -103,16 +104,11 @@ def query_gemma3(image, prompt):
 
 def extract_time_from_image(image):
     """Extract time with UTC+1 offset from the bottom right corner using OCR."""
-    # Define the bottom right region (e.g., last 10% of width and height)
     width, height = image.size
     region_width = int(width * 0.1)
     region_height = int(height * 0.1)
     bottom_right = image.crop((width - region_width, height - region_height, width, height))
-    
-    # Use OCR to extract text
     ocr_text = pytesseract.image_to_string(bottom_right).strip()
-    
-    # Look for time pattern (e.g., "14:30 UTC+1")
     time_match = re.search(r'(\d{1,2}:\d{2}\s*UTC\+1)', ocr_text, re.IGNORECASE)
     if time_match:
         return time_match.group(1)
@@ -120,16 +116,11 @@ def extract_time_from_image(image):
 
 def extract_ticker_from_image(image):
     """Extract ticker symbol from the image using OCR as a fallback."""
-    # Define a region near the top left (adjust based on chart layout)
     width, height = image.size
     region_width = int(width * 0.3)
     region_height = int(height * 0.1)
     top_left = image.crop((0, 0, region_width, region_height))
-    
-    # Use OCR to extract text
     ocr_text = pytesseract.image_to_string(top_left).strip()
-    
-    # Look for ticker pattern (e.g., "BTC/USDT")
     ticker_match = re.search(r'([A-Z]{3,5}/[A-Z]{3,5})', ocr_text, re.IGNORECASE)
     if ticker_match:
         return ticker_match.group(1)
@@ -152,7 +143,6 @@ def parse_gemma3_response(chart_description):
         "smart_money_analysis": "Unknown"
     }
     
-    # Flexible regex patterns to handle variations
     patterns = [
         (r'(?:Ticker Symbol|Symbol):?\s*([^\n]+)', "ticker"),
         (r'(?:Timeframe):?\s*([^\n]+)', "chart_timeframe"),
@@ -174,11 +164,32 @@ def parse_gemma3_response(chart_description):
     
     return parsed
 
+def export_model(export_dir):
+    """Export the ChromaDB and fine-tuned Gemma 3 model."""
+    # Export ChromaDB
+    db_path = "./photo_db"
+    if os.path.exists(db_path):
+        shutil.copytree(db_path, os.path.join(export_dir, "photo_db"), dirs_exist_ok=True)
+        print(f"Exported ChromaDB to {os.path.join(export_dir, 'photo_db')}")
+    else:
+        print("ChromaDB not found at ./photo_db")
+    
+    # Export fine-tuned Gemma 3 model (assumes LM Studio directory)
+    lmstudio_models_dir = os.path.expanduser("~/lmstudio/models")
+    finetuned_model_dir = "gemma3:12b-it-qat-finetuned"  # Adjust based on your fine-tuned model name
+    source_path = os.path.join(lmstudio_models_dir, finetuned_model_dir)
+    if os.path.exists(source_path):
+        shutil.copytree(source_path, os.path.join(export_dir, "gemma3_finetuned"), dirs_exist_ok=True)
+        print(f"Exported Gemma 3 model to {os.path.join(export_dir, 'gemma3_finetuned')}")
+    else:
+        print(f"Fine-tuned Gemma 3 model not found at {source_path}. Ensure fine-tuning is complete.")
+
 def main():
     print("What would you like to do?")
     print(" [1] Add data to a model (existing or new)")
     print(" [2] Query a model")
-    action = input("Select 1 or 2: ").strip()
+    print(" [3] Export model")
+    action = input("Select 1, 2, or 3: ").strip()
     client_db = chromadb.PersistentClient(path="./photo_db")
     if action == '2':
         # Query mode: select model, then run query script
@@ -186,6 +197,12 @@ def main():
         import subprocess
         print("Launching query interface...")
         subprocess.run([sys.executable, "query_rag.py"])
+        sys.exit(0)
+    elif action == '3':
+        # Export mode
+        export_dir = input("Enter export directory path (e.g., /path/to/export): ").strip()
+        os.makedirs(export_dir, exist_ok=True)
+        export_model(export_dir)
         sys.exit(0)
     elif action == '1':
         # Add data mode: select model, then continue as before
