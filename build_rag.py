@@ -13,6 +13,7 @@ import ffmpeg
 import pytesseract
 import json
 import re
+from transformers import AutoProcessor, LlavaForConditionalGeneration  # Real LLaVA imports
 
 # Allow override of photo and video folders via environment variables for Docker compatibility
 photo_folder = os.environ.get("RAG_PHOTO_FOLDER", os.path.expanduser("~/Pictures/RAG_Photos"))
@@ -84,10 +85,15 @@ def main():
         processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         device = "mps" if torch.backends.mps.is_available() else "cpu"
         model.to(device)
-        # Load BLIP for image captioning
-        from transformers import BlipProcessor, BlipForConditionalGeneration
-        blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+        # Load LLaVA model
+        print("Loading LLaVA model...")
+        model_id = "llava-hf/llava-1.5-7b-hf"
+        llava_processor = AutoProcessor.from_pretrained(model_id)
+        llava_model = LlavaForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16 if torch.cuda.is_available() or torch.backends.mps.is_available() else torch.float32,
+            device_map="auto"
+        )
         photos = find_photos()
         videos = find_videos()
         print("\nDiscovered video files:")
@@ -102,13 +108,34 @@ def main():
                 inputs = processor(images=image, return_tensors="pt").to(device)
                 with torch.no_grad():
                     embedding = model.get_image_features(**inputs).cpu().numpy().flatten()
-                # BLIP caption for image
-                blip_inputs = blip_processor(images=image, return_tensors="pt")
-                blip_out = blip_model.generate(**blip_inputs)
-                caption = blip_processor.decode(blip_out[0], skip_special_tokens=True)
+                # LLaVA description for image (adapted for general images, but using trading prompt for consistency)
+                prompt = "USER: <image>\nAnalyze this image. If it's a trading chart, extract the ticker symbol, timeframe, current price, and describe visible candlestick patterns or technical indicators. Otherwise, provide a general description. ASSISTANT:"
+                llava_inputs = llava_processor(images=image, text=prompt, return_tensors="pt").to(llava_model.device)
+                llava_out = llava_model.generate(**llava_inputs, max_new_tokens=200)
+                chart_description = llava_processor.batch_decode(llava_out, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+                # Parse for metadata (similar to video frames)
+                ticker = "Unknown"
+                chart_timeframe = "Unknown"
+                current_price = "Unknown"
+                if "ticker:" in chart_description.lower():
+                    ticker_match = re.search(r'ticker: ([A-Z]{3,5}/[A-Z]{3,5})', chart_description, re.IGNORECASE)
+                    ticker = ticker_match.group(1) if ticker_match else "Unknown"
+                if "timeframe:" in chart_description.lower():
+                    timeframe_match = re.search(r'timeframe: (\b[1-9][0-9]?[mhd]\b)', chart_description, re.IGNORECASE)
+                    chart_timeframe = timeframe_match.group(1) if timeframe_match else "Unknown"
+                if "price:" in chart_description.lower():
+                    price_match = re.search(r'price: ([\d.,]+)', chart_description, re.IGNORECASE)
+                    current_price = price_match.group(1) if price_match else "Unknown"
                 collection.add(
                     embeddings=[embedding.tolist()],
-                    metadatas=[{"path": photo_path, "type": "image", "caption": caption}],
+                    metadatas=[{
+                        "path": photo_path,
+                        "type": "image",
+                        "chart_description": chart_description,
+                        "ticker": ticker,
+                        "current_price": current_price,
+                        "chart_timeframe": chart_timeframe
+                    }],
                     ids=[f"photo_{idx}"]
                 )
             except Exception as ie:
@@ -187,87 +214,65 @@ def main():
                         inputs = processor(images=pil_img, return_tensors="pt").to(device)
                         with torch.no_grad():
                             emb = model.get_image_features(**inputs).cpu().numpy().flatten()
-                        # BLIP caption
+                        # LLaVA description
                         try:
-                            blip_inputs = blip_processor(images=pil_img, return_tensors="pt")
-                            blip_out = blip_model.generate(**blip_inputs)
-                            caption = blip_processor.decode(blip_out[0], skip_special_tokens=True)
-                        except Exception as blip_err:
-                            print(f" BLIP captioning failed for frame {frame_idx}: {blip_err}")
-                            caption = ""
-                        # OCR for chart text
-                        ocr_text = pytesseract.image_to_string(pil_img)
-                        # Parse specific chart elements from OCR text
-                        # Extract chart timeframe (e.g., '1m', '5m', '15m', '1h', '4h', '1d', etc.)
-                        timeframe_match = re.search(r'(\b[1-9][0-9]?m\b|\b[1-9][0-9]?h\b|\b[1-9][0-9]?d\b)', ocr_text, re.IGNORECASE)
-                        chart_timeframe = timeframe_match.group(0) if timeframe_match else "Unknown"
-                        # Extract ticker symbol (e.g., 'BTC/USDT')
-                        ticker_match = re.search(r'([A-Z]{3,5}/[A-Z]{3,5})', ocr_text, re.IGNORECASE)
-                        ticker = ticker_match.group(0) if ticker_match else "Unknown"
-                        # Extract current price (heuristic: look for 'Last' or large number; adjust regex based on trading platform UI)
-                        price_match = re.search(r'(?:Last|Price)[:\s]*([\d.,]+)', ocr_text, re.IGNORECASE)
-                        current_price = price_match.group(1) if price_match else "Unknown"
-                        # Basic OpenCV candlestick detection (contours)
-                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-                        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        candlestick_info = []
-                        for cnt in contours:
-                            x, y, w, h = cv2.boundingRect(cnt)
-                            # Heuristic: candlesticks are vertical rectangles of certain aspect ratio
-                            if h > w * 2 and w > 5 and h > 20:
-                                cs_region = frame[y:y+h, x:x+w]
-                                avg_color = np.mean(cs_region, axis=(0,1)).astype(int)  # BGR
-                                if avg_color[1] > avg_color[2] + 50 and avg_color[1] > avg_color[0] + 50:  # Green dominant (bullish)
-                                    cs_type = 'bullish'
-                                elif avg_color[2] > avg_color[1] + 50 and avg_color[2] > avg_color[0] + 50:  # Red dominant (bearish)
-                                    cs_type = 'bearish'
-                                else:
-                                    cs_type = 'neutral'
-                                candlestick_info.append({
-                                    'x': int(x),
-                                    'y': int(y),
-                                    'w': int(w),
-                                    'h': int(h),
-                                    'type': cs_type
-                                })
-                        # Generate explicit chart description
-                        num_candles = len(candlestick_info)
-                        num_bullish = sum(1 for cs in candlestick_info if cs['type'] == 'bullish')
-                        num_bearish = sum(1 for cs in candlestick_info if cs['type'] == 'bearish')
-                        chart_description = (
-                            f"The frame displays a trading chart for {ticker} on the {chart_timeframe} timeframe. "
-                            f"Current price: {current_price}. "
-                            f"There are {num_candles} candlesticks visible, including {num_bullish} bullish (green) and {num_bearish} bearish (red). "
-                            f"General scene: {caption}."
-                        )
-                        ts = frame_idx / fps if fps else 0
-                        frame_embeddings.append(emb.tolist())
-                        frame_metadatas.append({
-                            "path": video_path,
-                            "type": "video_frame",
-                            "timestamp": ts,
-                            "caption": caption,
-                            "chart_description": chart_description,  # New field for explicit documentation
-                            "ticker": ticker,
-                            "current_price": current_price,
-                            "chart_timeframe": chart_timeframe,
-                            "candlesticks": json.dumps(candlestick_info),
-                            "ocr_text": ocr_text  # Optional: keep truncated or remove if not needed
-                        })
-                        frame_ids.append(f"video_{vidx}_frame_{frame_idx}")
-                        frame_times.append(ts)
-                        frame_total += 1
-                        if frame_total % 100 == 0:
-                            now = time.time()
-                            batch_time = now - last_time
-                            elapsed = now - start_time
-                            frames_left = len(sampled_frames) - frame_total
-                            if frame_total > 0:
-                                avg_time_per_frame = elapsed / frame_total
-                                eta = avg_time_per_frame * frames_left
-                            print(f" Processed {frame_total}/{len(sampled_frames)} frames. Last 100: {batch_time:.1f}s, Elapsed: {elapsed:.1f}s, ETA: {eta/60:.1f} min")
-                            last_time = now
+                            prompt = "USER: <image>\nAnalyze this trading chart frame. Extract the ticker symbol, timeframe, current price, and describe visible candlestick patterns or technical indicators. ASSISTANT:"
+                            llava_inputs = llava_processor(images=pil_img, text=prompt, return_tensors="pt").to(llava_model.device)
+                            llava_out = llava_model.generate(**llava_inputs, max_new_tokens=200)
+                            chart_description = llava_processor.batch_decode(llava_out, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+                            # Parse LLaVA output (example: assumes structured response)
+                            # You may need to parse the description for specific fields
+                            ticker = "Unknown"
+                            chart_timeframe = "Unknown"
+                            current_price = "Unknown"
+                            candlestick_info = []
+                            if "ticker:" in chart_description.lower():
+                                ticker_match = re.search(r'ticker: ([A-Z]{3,5}/[A-Z]{3,5})', chart_description, re.IGNORECASE)
+                                ticker = ticker_match.group(1) if ticker_match else "Unknown"
+                            if "timeframe:" in chart_description.lower():
+                                timeframe_match = re.search(r'timeframe: (\b[1-9][0-9]?[mhd]\b)', chart_description, re.IGNORECASE)
+                                chart_timeframe = timeframe_match.group(1) if timeframe_match else "Unknown"
+                            if "price:" in chart_description.lower():
+                                price_match = re.search(r'price: ([\d.,]+)', chart_description, re.IGNORECASE)
+                                current_price = price_match.group(1) if price_match else "Unknown"
+                            # Candlestick info (fallback to OpenCV if LLaVA doesn't provide it)
+                            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+                            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            for cnt in contours:
+                                x, y, w, h = cv2.boundingRect(cnt)
+                                if h > w * 2 and w > 5 and h > 20:
+                                    cs_region = frame[y:y+h, x:x+w]
+                                    avg_color = np.mean(cs_region, axis=(0,1)).astype(int)
+                                    cs_type = 'bullish' if avg_color[1] > avg_color[2] + 50 else 'bearish' if avg_color[2] > avg_color[1] + 50 else 'neutral'
+                                    candlestick_info.append({'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h), 'type': cs_type})
+                            ts = frame_idx / fps if fps else 0
+                            frame_embeddings.append(emb.tolist())
+                            frame_metadatas.append({
+                                "path": video_path,
+                                "type": "video_frame",
+                                "timestamp": ts,
+                                "chart_description": chart_description,
+                                "ticker": ticker,
+                                "current_price": current_price,
+                                "chart_timeframe": chart_timeframe,
+                                "candlesticks": json.dumps(candlestick_info)
+                            })
+                            frame_ids.append(f"video_{vidx}_frame_{frame_idx}")
+                            frame_times.append(ts)
+                            frame_total += 1
+                            if frame_total % 100 == 0:
+                                now = time.time()
+                                batch_time = now - last_time
+                                elapsed = now - start_time
+                                frames_left = len(sampled_frames) - frame_total
+                                if frame_total > 0:
+                                    avg_time_per_frame = elapsed / frame_total
+                                    eta = avg_time_per_frame * frames_left
+                                print(f" Processed {frame_total}/{len(sampled_frames)} frames. Last 100: {batch_time:.1f}s, Elapsed: {elapsed:.1f}s, ETA: {eta/60:.1f} min")
+                                last_time = now
+                        except Exception as fe:
+                            print(f" Skipping frame {frame_idx}: {fe}")
                     except Exception as fe:
                         print(f" Skipping frame {frame_idx}: {fe}")
                 vidcap.release()
