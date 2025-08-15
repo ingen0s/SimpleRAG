@@ -1,0 +1,35 @@
+sequenceDiagram
+    participant A as Alice
+    participant Q as Quantum Channel
+    participant E as Eve (Eavesdropper)
+    participant B as Bob
+    participant C as Classical Channel
+
+    Note over A,B: BB84 Quantum Key Distribution Protocol
+
+    %% Step 1: Alice prepares and sends quantum states
+    A->>Q: Prepare qubits with random bits (0/1) and bases (Rectilinear: +, Diagonal: ×)
+    Note over A: e.g., |0⟩ or |1⟩ in + basis, |+⟩ or |−⟩ in × basis
+    Q->>E: Quantum states transmitted
+    E->>E: (Optional) Eve measures some qubits in random bases
+    Note over E: Eve's measurement may disturb quantum states
+    E->>Q: Forward (possibly altered) qubits
+    Q->>B: Bob receives qubits
+
+    %% Step 2: Bob measures received qubits
+    B->>B: Measure qubits in random bases (+ or ×)
+    Note over B: Records measurement outcomes and bases
+
+    %% Step 3: Basis reconciliation over classical channel
+    A->>C: Announce bases used for each qubit
+    B->>C: Announce bases used for measurement
+    Note over A,B: Discard bits where bases differ
+
+    %% Step 4: Key verification
+    alt Error rate low
+        A->>B: Use remaining bits as secure key
+        Note over A,B: Key is secure
+    else Error rate high
+        A->>B: Abort protocol
+        Note over A,B: Eavesdropping detected
+    end

@@ -1,0 +1,13 @@
+torch
+transformers
+chromadb
+pillow
+opencv-python
+openai-whisper
+ffmpeg-python
+openai
+PyQt5==5.15.9
+PyQtWebEngine==5.15.9
+networkx
+plotly
+pytesseract

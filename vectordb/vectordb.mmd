@@ -1,0 +1,12 @@
+graph TD
+    A[Raw Data: Text Images Audio] --> B[Embedding Model: BERT ResNet]
+    B --> C[Vector Embeddings: Arrays]
+    C --> D{Vector Database}
+    D --> E[Storage: In-Memory or Disk]
+    D --> F[Indexing: HNSW IVFFlat PQ]
+    G[Query Input: Search Term] --> H[Embedding Model]
+    H --> I[Query Vector]
+    I --> J[Similarity Search: Cosine Euclidean Dot]
+    F --> J
+    J --> K[Top-K Similar Vectors: Metadata]
+    K --> L[Results: Ranked by Similarity]
